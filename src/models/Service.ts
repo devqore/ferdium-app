@@ -2,6 +2,7 @@ import { basename, join } from 'node:path';
 import { webContents } from '@electron/remote';
 import { ipcRenderer } from 'electron';
 import { action, autorun, computed, makeObservable, observable } from 'mobx';
+import ms from 'ms';
 import type ElectronWebView from 'react-electron-web-view';
 
 import { v4 as uuidV4 } from 'uuid';
@@ -16,6 +17,17 @@ import type { IRecipe } from './Recipe';
 import UserAgent from './UserAgent';
 
 const debug = require('../preload-safe-debug')('Ferdium:Service');
+
+const NETWORK_LOAD_ERROR_CODES = new Set([
+  -101, // ERR_CONNECTION_RESET
+  -102, // ERR_CONNECTION_REFUSED
+  -105, // ERR_NAME_NOT_RESOLVED
+  -106, // ERR_INTERNET_DISCONNECTED
+  -109, // ERR_ADDRESS_UNREACHABLE
+  -118, // ERR_CONNECTION_TIMED_OUT
+  -137, // ERR_NAME_RESOLUTION_FAILED
+]);
+const NETWORK_LOAD_RETRY_DELAY = ms('15s');
 
 // Global registry for active partitions
 // This is needed to prevent events of the same partition from being registered multiple times (when using custom sandboxes)
@@ -36,6 +48,8 @@ export default class Service {
   _webview: ElectronWebView | null = null;
 
   timer: NodeJS.Timeout | null = null;
+
+  networkReloadTimer: NodeJS.Timeout | null = null;
 
   events = {};
 
@@ -266,6 +280,8 @@ export default class Service {
   }
 
   @action _didLoad(): void {
+    this._clearNetworkReloadTimer();
+
     this.isLoading = false;
     this.isLoadingPage = false;
 
@@ -274,11 +290,21 @@ export default class Service {
     }
   }
 
-  @action _didFailLoad(event: { errorDescription: string }): void {
+  @action _didFailLoad(event: {
+    errorCode?: number;
+    errorDescription: string;
+  }): void {
     this.isError = false;
     this.errorMessage = event.errorDescription;
     this.isLoading = false;
     this.isLoadingPage = false;
+
+    if (
+      typeof event.errorCode === 'number' &&
+      NETWORK_LOAD_ERROR_CODES.has(event.errorCode)
+    ) {
+      this._scheduleNetworkReload();
+    }
   }
 
   @action _hasCrashed(): void {
@@ -329,6 +355,10 @@ export default class Service {
   }
 
   set webview(webview) {
+    if (!webview) {
+      this._clearNetworkReloadTimer();
+    }
+
     this._webview = webview;
   }
 
@@ -686,5 +716,35 @@ export default class Service {
 
   toggleToTalk(): void {
     this.webview?.send('toggle-to-talk');
+  }
+
+  _clearNetworkReloadTimer(): void {
+    if (this.networkReloadTimer) {
+      clearTimeout(this.networkReloadTimer);
+      this.networkReloadTimer = null;
+    }
+  }
+
+  _scheduleNetworkReload(): void {
+    if (this.networkReloadTimer || !this.webview || !this.isEnabled) {
+      return;
+    }
+
+    debug('Scheduling network reload for', this.name);
+
+    this.networkReloadTimer = setTimeout(() => {
+      this.networkReloadTimer = null;
+
+      if (!this.webview || !this.isEnabled) {
+        return;
+      }
+
+      debug('Retrying failed network load for', this.name, this.url);
+
+      this.webview.loadURL(this.url).catch(error => {
+        debug('Retrying failed network load failed for', this.name, error);
+        this._scheduleNetworkReload();
+      });
+    }, NETWORK_LOAD_RETRY_DELAY);
   }
 }

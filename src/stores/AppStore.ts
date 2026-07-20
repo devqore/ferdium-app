@@ -58,6 +58,10 @@ const autoLauncher = new AutoLaunch({
 
 const CATALINA_NOTIFICATION_HACK_KEY =
   '_temp_askedForCatalinaNotificationPermissions';
+const RELOAD_AFTER_RESUME_DELAY = ms('10s');
+const RELOAD_AFTER_RESUME_RETRY_INTERVAL = ms('5s');
+const RELOAD_AFTER_RESUME_NETWORK_CHECK_TIMEOUT = ms('5s');
+const NETWORK_CHECK_URL = 'https://www.google.com/generate_204';
 
 const locales = generatedTranslations();
 
@@ -135,6 +139,12 @@ export default class AppStore extends TypedStore {
   @observable launchInBackground = DEFAULT_APP_SETTINGS.autoLaunchInBackground;
 
   fetchDataInterval: NodeJS.Timeout | null = null;
+
+  reloadAfterResumeInterval: NodeJS.Timeout | null = null;
+
+  reloadAfterResumeTimeout: NodeJS.Timeout | null = null;
+
+  reloadAfterResumeCheckInProgress = false;
 
   @observable downloads: Download[] = [];
 
@@ -326,17 +336,34 @@ export default class AppStore extends TypedStore {
       const idleTime = this.stores.settings.app.reloadAfterResumeTime;
 
       if (
-        this.timeSuspensionStart.add(idleTime, 'm').isBefore(moment()) &&
+        this.timeSuspensionStart
+          .clone()
+          .add(idleTime, 'm')
+          .isBefore(moment()) &&
         this.stores.settings.app.reloadAfterResume
       ) {
-        debug('Reloading services, user info and features');
+        debug('Reloading Ferdium after network has settled');
 
-        setInterval(() => {
-          debug('Reload app interval is starting');
-          if (this.isOnline) {
-            window.location.reload();
-          }
-        }, ms('2s'));
+        if (this.reloadAfterResumeInterval) {
+          clearInterval(this.reloadAfterResumeInterval);
+          this.reloadAfterResumeInterval = null;
+        }
+
+        if (this.reloadAfterResumeTimeout) {
+          clearTimeout(this.reloadAfterResumeTimeout);
+          this.reloadAfterResumeTimeout = null;
+        }
+
+        this.reloadAfterResumeTimeout = setTimeout(() => {
+          this.reloadAfterResumeTimeout = null;
+
+          this._reloadAfterResumeIfNetworkReady();
+
+          this.reloadAfterResumeInterval = setInterval(
+            () => this._reloadAfterResumeIfNetworkReady(),
+            RELOAD_AFTER_RESUME_RETRY_INTERVAL,
+          );
+        }, RELOAD_AFTER_RESUME_DELAY);
       }
     });
 
@@ -844,6 +871,72 @@ export default class AppStore extends TypedStore {
 
   async _checkAutoStart() {
     return autoLauncher.isEnabled() || false;
+  }
+
+  async _reloadAfterResumeIfNetworkReady() {
+    if (this.reloadAfterResumeCheckInProgress) {
+      return;
+    }
+
+    this.reloadAfterResumeCheckInProgress = true;
+
+    try {
+      if (!(await this._isNetworkReachable())) {
+        debug('Network is not reachable yet, delaying Ferdium reload');
+        return;
+      }
+
+      debug('Network is reachable, reloading Ferdium');
+
+      if (this.reloadAfterResumeInterval) {
+        clearInterval(this.reloadAfterResumeInterval);
+        this.reloadAfterResumeInterval = null;
+      }
+
+      window.location.reload();
+    } finally {
+      this.reloadAfterResumeCheckInProgress = false;
+    }
+  }
+
+  async _isNetworkReachable() {
+    if (!this.isOnline) {
+      return false;
+    }
+
+    const urls = [
+      NETWORK_CHECK_URL,
+      ...this.stores.services.all
+        .filter(service => service.isEnabled)
+        .map(service => service.url)
+        .slice(0, 3),
+    ];
+
+    const results = await Promise.all(urls.map(url => this._canReachUrl(url)));
+
+    return results.some(Boolean);
+  }
+
+  async _canReachUrl(url: string) {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      RELOAD_AFTER_RESUME_NETWORK_CHECK_TIMEOUT,
+    );
+
+    try {
+      await fetch(url, {
+        cache: 'no-store',
+        mode: 'no-cors',
+        signal: controller.signal,
+      });
+
+      return true;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   async _systemDND() {

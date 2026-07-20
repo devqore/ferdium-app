@@ -14,6 +14,9 @@ export ELECTRON_BUILDER_CACHE=$HOME/.cache/electron-builder
 export CSC_IDENTITY_AUTO_DISCOVERY=false
 export CI=true
 
+ALLOW_NODE_MISMATCH=false
+ENGINE_STRICT_OVERRIDDEN=false
+
 # -----------------------------------------------------------------------------
 #                  Utility functions
 fail_with_docs() {
@@ -24,8 +27,75 @@ fail_with_docs() {
   exit 1
 }
 
+restore_engine_strict() {
+  if [ "$ENGINE_STRICT_OVERRIDDEN" != "true" ]; then
+    return
+  fi
+
+  if [ -f "$MAIN_NPMRC_BACKUP" ]; then
+    cp "$MAIN_NPMRC_BACKUP" .npmrc || true
+  fi
+  if [ -f "$RECIPES_NPMRC_BACKUP" ] && [ -d recipes ]; then
+    cp "$RECIPES_NPMRC_BACKUP" recipes/.npmrc || true
+  fi
+  rm -f "$MAIN_NPMRC_BACKUP" "$RECIPES_NPMRC_BACKUP"
+}
+
+disable_engine_strict_for_run() {
+  if [ "$ENGINE_STRICT_OVERRIDDEN" = "true" ]; then
+    return
+  fi
+
+  # pnpm also enforces the Node version via .npmrc, including for nested pnpm
+  # calls inside package scripts. Temporarily override it only for this run.
+  export npm_config_engine_strict=false
+  export pnpm_config_engine_strict=false
+
+  MAIN_NPMRC_BACKUP=$(mktemp)
+  RECIPES_NPMRC_BACKUP=$(mktemp)
+  cp .npmrc "$MAIN_NPMRC_BACKUP"
+  cp recipes/.npmrc "$RECIPES_NPMRC_BACKUP"
+
+  ENGINE_STRICT_OVERRIDDEN=true
+  trap restore_engine_strict EXIT
+
+  printf "\nengine-strict = false\n" >>.npmrc
+  printf "\nengine-strict = false\n" >>recipes/.npmrc
+}
+
+confirm_continue() {
+  printf "\n*************** WARNING ***************\n"
+  echo "$1"
+  echo ""
+
+  if ! [ -t 0 ]; then
+    fail_with_docs "Cannot prompt to continue in a non-interactive shell"
+  fi
+
+  read -r -p "Continue anyway? [y/N] " CONTINUE_ANYWAY
+  case "$CONTINUE_ANYWAY" in
+  [yY] | [yY][eE][sS])
+    ALLOW_NODE_MISMATCH=true
+    ;;
+  *)
+    fail_with_docs "Build cancelled"
+    ;;
+  esac
+}
+
 command_exists() {
   type "$1" &>/dev/null 2>&1
+}
+
+ensure_electron_installed() {
+  if node -e 'require("electron")' >/dev/null 2>&1; then
+    return
+  fi
+
+  printf "\n*************** Repairing Electron install ***************\n"
+  pnpm rebuild electron
+
+  node -e 'require("electron")' >/dev/null 2>&1 || fail_with_docs "Electron failed to install correctly"
 }
 
 # -----------------------------------------------------------------------------
@@ -37,7 +107,7 @@ command_exists node || fail_with_docs "Node is not installed"
 EXPECTED_NODE_VERSION=$(cat .nvmrc)
 ACTUAL_NODE_VERSION=$(node -v)
 if [ "v$EXPECTED_NODE_VERSION" != "$ACTUAL_NODE_VERSION" ]; then
-  fail_with_docs "You are not running the expected version of node!
+  confirm_continue "You are not running the expected version of node!
     expected: [v$EXPECTED_NODE_VERSION]
     actual  : [$ACTUAL_NODE_VERSION]"
 fi
@@ -72,6 +142,10 @@ else
 
   git -C recipes clean -fxd # Clean recipes folder/submodule
   git clean -fxd            # Note: This will blast away the 'recipes' folder if you have symlinked it
+fi
+
+if [ "$ALLOW_NODE_MISMATCH" = "true" ]; then
+  disable_engine_strict_for_run
 fi
 
 # -----------------------------------------------------------------------------
@@ -111,6 +185,7 @@ popd
 # -----------------------------------------------------------------------------
 # Now the meat.....
 pnpm i
+ensure_electron_installed
 pnpm prepare-code
 pnpm lint
 pnpm test

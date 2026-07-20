@@ -128,7 +128,7 @@
     "tar": "6.2.1",
     "tinycolor2": "1.6.0",
     "tslib": "2.7.0",
-    "useragent-generator": "1.1.1-amkt-22079-finish.0",
+    "useragent-generator": "1.1.0",
     "uuid": "9.0.1",
     "validator": "13.12.0"
   },
